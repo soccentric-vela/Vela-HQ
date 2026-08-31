@@ -1,0 +1,104 @@
+# Vela-HQ — full deployment stack.
+#
+# Stateful services (postgres, minio, redis, keycloak) are also declared here
+# so a single `docker compose up` brings up the whole HQ. Production requires
+# secrets to be supplied via the environment (see app/config.py — the services
+# fail closed unless VELAHQ_ENV=production and real secrets are set).
+#
+# Usage:  docker compose -f docker/docker-compose.yml --env-file .env up -d
+name: velahq
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${VELAHQ_DB_USER:-velahq}
+      POSTGRES_PASSWORD: ${VELAHQ_DB_PASSWORD:-velahq}
+      POSTGRES_DB: ${VELAHQ_DB_NAME:-velahq}
+    volumes:
+      - velahq-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${VELAHQ_S3_ACCESS_KEY:-velahq}
+      MINIO_ROOT_PASSWORD: ${VELAHQ_S3_SECRET_KEY:-velahq-dev-secret}
+    volumes:
+      - velahq-minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment: &api-env
+      VELAHQ_ENV: ${VELAHQ_ENV:-production}
+      VELAHQ_DATABASE_URL: postgresql+asyncpg://${ACADIAQ_DB_USER:-velahq}:${ACADIAQ_DB_PASSWORD:-velahq}@postgres:5432/${ACADIAQ_DB_NAME:-velahq}
+      VELAHQ_REDIS_URL: redis://redis:6379/0
+      VELAHQ_S3_ENDPOINT_URL: http://minio:9000
+      VELAHQ_S3_ACCESS_KEY: ${VELAHQ_S3_ACCESS_KEY:-velahq}
+      VELAHQ_S3_SECRET_KEY: ${VELAHQ_S3_SECRET_KEY:-velahq-dev-secret}
+      VELAHQ_S3_BUCKET: ${VELAHQ_S3_BUCKET:-velahq}
+      VELAHQ_OIDC_ISSUER: ${VELAHQ_OIDC_ISSUER:?set VELAHQ_OIDC_ISSUER}
+      VELAHQ_OIDC_CLIENT_ID: ${VELAHQ_OIDC_CLIENT_ID:-velahq-api}
+      VELAHQ_OIDC_CLIENT_SECRET: ${VELAHQ_OIDC_CLIENT_SECRET:?set VELAHQ_OIDC_CLIENT_SECRET}
+      VELAHQ_SESSION_SECRET_KEY: ${VELAHQ_SESSION_SECRET_KEY:?set VELAHQ_SESSION_SECRET_KEY}
+      VELAHQ_CORS_ALLOW_ORIGINS: ${VELAHQ_CORS_ALLOW_ORIGINS:-http://localhost:8080}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${VELAHQ_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: python -m gateway.server
+    environment: *api-env
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${VELAHQ_GATEWAY_PORT:-50051}:50051"
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+    depends_on:
+      - api
+    ports:
+      - "${VELAHQ_WEB_PORT:-8080}:80"
+
+volumes:
+  velahq-pg-data:
+  velahq-minio-data:
